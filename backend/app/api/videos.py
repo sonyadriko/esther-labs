@@ -22,9 +22,11 @@ settings = get_settings()
 
 
 async def process_video_generation(video_id: str, db_url: str):
-    """Background task to process video generation."""
+    """Background task to process video generation with Veo 3 AI."""
     from sqlalchemy import create_engine
     from sqlalchemy.orm import sessionmaker
+    from app.services.veo3_generator import veo3_generator
+    from moviepy import VideoFileClip, AudioFileClip, concatenate_videoclips
     
     engine = create_engine(db_url)
     SessionLocal = sessionmaker(bind=engine)
@@ -47,7 +49,7 @@ async def process_video_generation(video_id: str, db_url: str):
         video.script = script_sections.get("full_script", "")
         db.commit()
         
-        # Step 2: Generate audio
+        # Step 2: Generate audio (voice over)
         video.status = VideoStatus.GENERATING_AUDIO.value
         db.commit()
         
@@ -59,22 +61,127 @@ async def process_video_generation(video_id: str, db_url: str):
         video.audio_url = audio_path
         db.commit()
         
-        # Step 3: Generate video
+        # Step 3: Generate AI video with Veo 3
         video.status = VideoStatus.GENERATING_VIDEO.value
         db.commit()
         
-        # Parse image paths
         image_paths = json.loads(video.image_paths) if video.image_paths else []
         
-        video_path = await video_generator.generate_video(
-            video_id=str(video.id),
-            image_paths=image_paths,
-            audio_path=audio_path,
-            script_sections=script_sections,
-            style=video.style
-        )
+        generated_clips = []
         
-        video.video_url = video_path
+        if image_paths:
+            # Generate video from each image (max 2 for cost efficiency)
+            scene_types = ["intro", "main", "outro"]
+            for i, img_path in enumerate(image_paths[:2]):
+                scene_type = scene_types[min(i, len(scene_types)-1)]
+                
+                # Build prompt for this scene
+                prompt = veo3_generator.build_product_video_prompt(
+                    video.product_name,
+                    video.product_description or "",
+                    video.style,
+                    scene_type
+                )
+                
+                try:
+                    clip_path = await veo3_generator.generate_video_from_image(
+                        image_path=img_path,
+                        prompt=prompt,
+                        video_id=f"{video.id}_{i}",
+                        aspect_ratio="9:16",
+                        duration_seconds=4  # 4 seconds per clip to save cost
+                    )
+                    generated_clips.append(clip_path)
+                except Exception as e:
+                    print(f"Veo 3 generation failed for clip {i}: {e}")
+                    # Fallback to MoviePy slideshow for this clip
+                    fallback_path = await video_generator.generate_video(
+                        video_id=f"{video.id}_{i}_fallback",
+                        image_paths=[img_path],
+                        audio_path=audio_path,
+                        script_sections={"hook": script_sections.get("hook", "")},
+                        style=video.style
+                    )
+                    generated_clips.append(fallback_path)
+        else:
+            # Text-to-video only (no image)
+            prompt = veo3_generator.build_product_video_prompt(
+                video.product_name,
+                video.product_description or "",
+                video.style,
+                "main"
+            )
+            
+            try:
+                clip_path = await veo3_generator.generate_video_from_text(
+                    prompt=prompt,
+                    video_id=str(video.id),
+                    aspect_ratio="9:16",
+                    duration_seconds=8
+                )
+                generated_clips.append(clip_path)
+            except Exception as e:
+                print(f"Text-to-video failed: {e}")
+                # Fallback
+                fallback_path = await video_generator.generate_video(
+                    video_id=str(video.id),
+                    image_paths=[],
+                    audio_path=audio_path,
+                    script_sections=script_sections,
+                    style=video.style
+                )
+                generated_clips.append(fallback_path)
+        
+        # Step 4: Combine clips and add audio
+        if len(generated_clips) == 1:
+            final_video_path = generated_clips[0]
+        else:
+            # Concatenate multiple clips
+            clips = [VideoFileClip(p) for p in generated_clips]
+            combined = concatenate_videoclips(clips, method="compose")
+            
+            final_video_path = os.path.join(settings.output_dir, f"{video.id}_combined.mp4")
+            combined.write_videofile(
+                final_video_path, 
+                codec="libx264",
+                audio_codec="aac",
+                fps=30
+            )
+            
+            # Cleanup
+            for clip in clips:
+                clip.close()
+            combined.close()
+        
+        # Add voice over to final video
+        try:
+            video_clip = VideoFileClip(final_video_path)
+            audio_clip = AudioFileClip(audio_path)
+            
+            # If audio is longer than video, trim audio
+            if audio_clip.duration > video_clip.duration:
+                audio_clip = audio_clip.subclipped(0, video_clip.duration)
+            
+            # If video is longer than audio, that's fine (silent end)
+            final_with_audio = video_clip.with_audio(audio_clip)
+            
+            output_path = os.path.join(settings.output_dir, f"{video.id}.mp4")
+            final_with_audio.write_videofile(
+                output_path,
+                codec="libx264",
+                audio_codec="aac",
+                fps=30
+            )
+            
+            video_clip.close()
+            audio_clip.close()
+            final_with_audio.close()
+            
+            video.video_url = output_path
+        except Exception as e:
+            print(f"Audio merge failed: {e}")
+            video.video_url = final_video_path
+        
         video.status = VideoStatus.DONE.value
         
         # Create thumbnail
@@ -94,6 +201,7 @@ async def process_video_generation(video_id: str, db_url: str):
         print(f"Video generation failed: {e}")
     finally:
         db.close()
+
 
 
 @router.post("", response_model=VideoResponse)
